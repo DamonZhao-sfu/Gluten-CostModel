@@ -61,6 +61,7 @@ object GlutenOptimization {
         GlutenMetadataModel(),
         GlutenPropertyModel(),
         GlutenExplain,
+        // offload rules
         RasRule.Factory.reuse(rules.toSeq))
     }
   }

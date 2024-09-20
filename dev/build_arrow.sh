@@ -17,14 +17,14 @@
 set -exu
 
 CURRENT_DIR=$(cd "$(dirname "$BASH_SOURCE")"; pwd)
-export SUDO=sudo
+export SUDO=""
 source ${CURRENT_DIR}/build_helper_functions.sh
 VELOX_ARROW_BUILD_VERSION=15.0.0
 ARROW_PREFIX=$CURRENT_DIR/../ep/_ep/arrow_ep
 BUILD_TYPE=Release
 
 function prepare_arrow_build() {
-  mkdir -p ${ARROW_PREFIX}/../ && pushd ${ARROW_PREFIX}/../ && sudo rm -rf arrow_ep/
+  mkdir -p ${ARROW_PREFIX}/../ && pushd ${ARROW_PREFIX}/../ &&  rm -rf arrow_ep/
   wget_and_untar https://archive.apache.org/dist/arrow/arrow-${VELOX_ARROW_BUILD_VERSION}/apache-arrow-${VELOX_ARROW_BUILD_VERSION}.tar.gz arrow_ep
   cd arrow_ep
   patch -p1 < $CURRENT_DIR/../ep/build-velox/src/modify_arrow.patch
@@ -51,14 +51,14 @@ function build_arrow_cpp() {
        -DARROW_RUNTIME_SIMD_LEVEL=NONE \
        -DARROW_WITH_UTF8PROC=OFF \
        -DARROW_TESTING=ON \
-       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCMAKE_INSTALL_PREFIX=/localhdd/hza214/conda/envs/velox-build/ \
        -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
        -DARROW_BUILD_SHARED=OFF \
        -DARROW_BUILD_STATIC=ON
 
  # Install thrift.
  cd _build/thrift_ep-prefix/src/thrift_ep-build
- sudo cmake --install ./ --prefix /usr/local/
+ cmake --install ./ --prefix /localhdd/hza214/conda/envs/velox-build/
  popd
 }
 

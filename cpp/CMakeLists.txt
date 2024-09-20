@@ -56,7 +56,7 @@ option(ENABLE_IAA "Enable IAA for de/compression" OFF)
 option(ENABLE_GCS "Enable GCS" OFF)
 option(ENABLE_S3 "Enable S3" OFF)
 option(ENABLE_HDFS "Enable HDFS" OFF)
-option(ENABLE_ORC "Enable ORC" OFF)
+option(ENABLE_ORC "Enable ORC" ON)
 option(ENABLE_ABFS "Enable ABFS" OFF)
 
 set(root_directory ${PROJECT_BINARY_DIR})

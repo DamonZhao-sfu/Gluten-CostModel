@@ -150,17 +150,17 @@ function compile {
     if [ -d xsimd-build ]; then
       echo "INSTALL xsimd."
       if [ $OS == 'Linux' ]; then
-        sudo cmake --install xsimd-build/
+        cmake --install xsimd-build/ --prefix /localhdd/hza214/conda/envs/velox-build/
       elif [ $OS == 'Darwin' ]; then
-        sudo cmake --install xsimd-build/
+        cmake --install xsimd-build/
       fi
     fi
     if [ -d gtest-build ]; then
       echo "INSTALL gtest."
       if [ $OS == 'Linux' ]; then
-        sudo cmake --install gtest-build/
+        cmake --install gtest-build/ --prefix /localhdd/hza214/conda/envs/velox-build/
       elif [ $OS == 'Darwin' ]; then
-        sudo cmake --install gtest-build/
+        cmake --install gtest-build/
       fi
     fi
   fi
@@ -192,7 +192,7 @@ function check_commit {
     fi
   else
     # Branch-new build requires all untracked files to be deleted. We only need the source code.
-    sudo git clean -dffx :/
+     git clean -dffx :/
   fi
 
   if [ -f ${VELOX_HOME}/velox-build.cache ]; then

@@ -103,6 +103,7 @@ object Best {
 
   object KnownCostPath {
     def apply[T <: AnyRef](ras: Ras[T], rasPath: RasPath[T]): KnownCostPath[T] = {
+      //println("Known Path:" + rasPath.plan())
       KnownCostPathImpl(rasPath, ras.costModel.costOf(rasPath.plan()))
     }
 
