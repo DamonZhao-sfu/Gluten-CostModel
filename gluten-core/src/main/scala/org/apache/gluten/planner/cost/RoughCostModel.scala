@@ -22,6 +22,9 @@ import org.apache.gluten.extension.columnar.transition.{ColumnarToRowLike, RowTo
 import org.apache.gluten.utils.PlanUtil
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, NamedExpression}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, JoinType, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.JoinEstimation
+import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.{ColumnarToRowExec, ProjectExec, RowToColumnarExec, SparkPlan}
@@ -102,45 +105,46 @@ class RoughCostModel extends LongCostModel {
         }
         cost
       }
-      case join@(_: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase) => {
+      case join@(_: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase | _: SortMergeJoinExecTransformerBase) => {
         {
           var buildcost = 0L
           var probecost = 0L
           var finalCost = 0L
           val logicalPlan = node.logicalLink.get
           val stats = logicalPlan.stats
-          val estimatedOutputRow = stats.rowCount.map(_.toLong).getOrElse(0L)
+          var maxNdv = 0L
+          var leftNdv = 0L
+          var rightNdv = 0L
+          var estimatedOutputRow = stats.rowCount.map(_.toLong).getOrElse(0L)
           join match {
             case smj: SortMergeJoinExecTransformerBase =>
               buildcost = smj.left.logicalLink.map { leftLogicalPlan =>
                 val leftStats = leftLogicalPlan.stats
-                //println(s"Left table size: ${leftStats.sizeInBytes}")
-                //println(s"Left table row count: ${leftStats.rowCount}")
+
                 leftStats.sizeInBytes.toLong
               }.getOrElse(0L)
               probecost = smj.right.logicalLink.map { rightLogicalPlan =>
                 val rightStats = rightLogicalPlan.stats
-                //println(s"Right table size: ${rightStats.sizeInBytes}")
-                //println(s"Right table row count: ${rightStats.rowCount}")
+
                 rightStats.sizeInBytes.toLong
               }.getOrElse(0L)
+              maxNdv = Math.max(leftNdv, rightNdv)
 
             case shj: ShuffledHashJoinExecTransformerBase => {
+
               shj.joinBuildSide match {
                 case BuildLeft =>
                   // Get the left child's logical plan and stats
                   buildcost += shj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
-                    // Use leftStats.sizeInBytes or leftStats.rowCount as needed
 
-                    leftStats.sizeInBytes.toLong // Convert to Long explicitly
-                  }.getOrElse(0L) // Default to 0L if logical link is not available
+                    leftStats.sizeInBytes.toLong
+                  }.getOrElse(0L)
 
                   probecost += shj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
-                    // Use rightStats.sizeInBytes or rightStats.rowCount as needed
 
-                    rightStats.sizeInBytes.toLong // or use this value for cost calculation
+                    rightStats.sizeInBytes.toLong
                   }.getOrElse(0L)
 
                 case BuildRight =>
@@ -148,37 +152,41 @@ class RoughCostModel extends LongCostModel {
                   // build table
                   buildcost += shj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
-                    // Use rightStats.sizeInBytes or rightStats.rowCount as needed
 
-                    rightStats.sizeInBytes.toLong // or use this value for cost calculation
+                    rightStats.sizeInBytes.toLong
                   }.getOrElse(0L) // Default to 0L if logical link is not available
 
                   probecost += shj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
-                    // Use leftStats.sizeInBytes or leftStats.rowCount as needed
 
-                    leftStats.sizeInBytes.toLong // Convert to Long explicitly
+                    leftStats.sizeInBytes.toLong
                   }.getOrElse(0L) // Default to 0L if logical link is not available
               }
+              maxNdv = Math.max(leftNdv, rightNdv)
             }
 
             case bhj: BroadcastHashJoinExecTransformerBase => {
+
               //println("native broadcastHashJoin")
+              def getDistinctCount(attr: Attribute, stats: Statistics): BigInt = {
+                stats.attributeStats.get(attr).flatMap(_.distinctCount).getOrElse(
+                  // Fallback to total row count if distinct count is not available
+                  stats.rowCount.getOrElse(BigInt(0))
+                )
+              }
+
+
               bhj.joinBuildSide match {
                 case BuildLeft =>
                   // Get the left child's logical plan and stats
                   buildcost += bhj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
-                    // Use leftStats.sizeInBytes or leftStats.rowCount as needed
-
-                    leftStats.sizeInBytes.toLong // Convert to Long explicitly
+                    leftStats.sizeInBytes.toLong
                   }.getOrElse(0L) // Default to 0L if logical link is not available
 
                   probecost += bhj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
-                    // Use rightStats.sizeInBytes or rightStats.rowCount as needed
-
-                    rightStats.sizeInBytes.toLong // or use this value for cost calculation
+                    rightStats.sizeInBytes.toLong
                   }.getOrElse(0L)
 
                 case BuildRight =>
@@ -186,21 +194,20 @@ class RoughCostModel extends LongCostModel {
                   // build table
                   buildcost += bhj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
-                    // Use rightStats.sizeInBytes or rightStats.rowCount as needed
-
-                    rightStats.sizeInBytes.toLong // or use this value for cost calculation
+                    rightStats.sizeInBytes.toLong
                   }.getOrElse(0L) // Default to 0L if logical link is not available
 
                   probecost += bhj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
-                    // Use leftStats.sizeInBytes or leftStats.rowCount as needed
-
-                    leftStats.sizeInBytes.toLong // Convert to Long explicitly
+                    leftStats.sizeInBytes.toLong
                   }.getOrElse(0L) // Default to 0L if logical link is not available
               }
+              maxNdv = Math.max(leftNdv, rightNdv)
             }
           }
-          val calculatedCost = 2 * buildcost + 4 * probecost
+          if (maxNdv == 0) maxNdv = 1
+          estimatedOutputRow = buildcost*probecost/maxNdv
+          val calculatedCost = 2 * buildcost + 4 * probecost + estimatedOutputRow
           if (calculatedCost.compareTo(1000L) > 0) finalCost = 1000L
           else if (calculatedCost.compareTo(10L) < 0) finalCost = 10L
           else finalCost = calculatedCost
@@ -236,12 +243,45 @@ class RoughCostModel extends LongCostModel {
                 var probecost = 0L
                 val logicalPlan = node.logicalLink.get
                 val stats = logicalPlan.stats
-                val estimatedOutputRow = stats.rowCount.getOrElse(0L)
+                var estimatedRow = 0L
                 join match {
                   case smj: SortMergeJoinExec =>
+                    val (leftPlan, rightPlan) = (smj.left.logicalLink.get, smj.right.logicalLink.get)
+                    val leftStats = leftPlan.stats
+                    val rightStats = rightPlan.stats
+                    val joinType = smj.joinType match {
+                      case ExistenceJoin(_) => LeftSemi
+                      case other => JoinType(other.toString)
+                    }
+                    val dummyJoin = Join(
+                      leftPlan,
+                      rightPlan,
+                      joinType,
+                      smj.condition,
+                      JoinHint.NONE
+                    )
+                    estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
+                    //println("row count is" + estimatedRow)
                     buildcost = smj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
                     probecost = smj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
                   case shj: ShuffledHashJoinExec =>
+                    val (leftPlan, rightPlan) = (shj.left.logicalLink.get, shj.right.logicalLink.get)
+                    val leftStats = leftPlan.stats
+                    val rightStats = rightPlan.stats
+                    // Handle ExistenceJoin and other join types
+                    val joinType = shj.joinType match {
+                      case ExistenceJoin(_) => LeftSemi
+                      case other => JoinType(other.toString)
+                    }
+                    val dummyJoin = Join(
+                      leftPlan,
+                      rightPlan,
+                      joinType,
+                      shj.condition,
+                      JoinHint.NONE
+                    )
+                    estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
+                    println("row count is" + estimatedRow)
                     shj.buildSide match {
                       case BuildLeft =>
                         buildcost = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
@@ -251,6 +291,22 @@ class RoughCostModel extends LongCostModel {
                         probecost = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
                     }
                   case bhj: BroadcastHashJoinExec =>
+                    val (leftPlan, rightPlan) = (bhj.left.logicalLink.get, bhj.right.logicalLink.get)
+                    val leftStats = leftPlan.stats
+                    val rightStats = rightPlan.stats
+                    val joinType = bhj.joinType match {
+                      case ExistenceJoin(_) => LeftSemi
+                      case other => JoinType(other.toString)
+                    }
+                    val dummyJoin = Join(
+                      leftPlan,
+                      rightPlan,
+                      joinType,
+                      bhj.condition,
+                      JoinHint.NONE
+                    )
+                    estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
+                    //println("row count is" + estimatedRow)
                     bhj.buildSide match {
                       case BuildLeft =>
                         buildcost = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
@@ -260,7 +316,10 @@ class RoughCostModel extends LongCostModel {
                         probecost = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
                     }
                 }
-                val calculatedCost = -4 * math.log(buildcost + 1) + 22 * math.log(probecost + 1)
+                val calculatedCost = -4 * math.log(buildcost + 1) + 22 * math.log(probecost + 1) + {
+                  val firstTwoDigits = estimatedRow.toString.take(2).toLong
+                  if (firstTwoDigits < 10) firstTwoDigits else firstTwoDigits / 10
+                }
                 node.setTagValue(new TreeNodeTag[AnyVal]("cost"), calculatedCost)
                 calculatedCost.toLong
               }
@@ -300,7 +359,7 @@ class RoughCostModel extends LongCostModel {
         val joinCount = countJoinsInPath(nativeAgg)
         if (joinCount >= 4) {
           println(s"Multiple joins ($joinCount) detected in the path of HashAggregateExecBaseTransformer")
-          10000L
+          100000L
         } else {
           // Default cost for HashAggregateExecBaseTransformer
           10L
