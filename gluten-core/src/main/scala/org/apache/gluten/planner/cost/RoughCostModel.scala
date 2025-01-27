@@ -28,33 +28,39 @@ import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec}
 import org.apache.spark.sql.execution.{ColumnarToRowExec, ProjectExec, RowToColumnarExec, SparkPlan}
+import org.apache.spark.sql.catalyst.plans.logical.Statistics
 
 class RoughCostModel extends LongCostModel {
+
+  private final val WeightR2C: Long = 5
+  private final val WeightC2R: Long = 2
+  private final val WeightMater: Long = 5
+  private final val WeightBroadCast: Long = 3
+  private final val WeightShuffle: Long = 4
+  private final val WeightRowShuffle: Long = 7
+
+  private final val WeightBuildMem: Long = 4
+  private final val WeightProbeMem: Long = 8
+  private final val WeightBuildCompute: Long = 1
+  private final val WeightProbeCompute: Long = 2
+  
+  private final val WeightCodegenBuildMem: Long = 8
+  private final val WeightCodegenProbeMem: Long = 10
+  private final val WeightCodegenBuildCompute: Long = 3
+  private final val WeightCodegenProbeCompute: Long = 7
+
+  private final val WeightHashTableEntry: Long = 16
+  private final val L3CacheSize: Long = 17*1024*1024
   private final val MemReadBandwidth: Long = 130*1024*1024*1024
   private final val MemWriteBandwidth: Long = 160*1024*1024*1024
   private final val CacheLineSize: Long = 64
-  private final val NetworkBandwidth: Long = 1.25*1024*1024*1024
-  private final val L1CacheMissRate: Double = 0.15
-  private final val L2CacheMissRate: Double = 0.40
-  private final val L3CacheMissRate: Double = 0.40
-  private final val L1ReadBandwidth: Long = 3311*1024*1024*1024
-  private final val L2ReadBandwidth: Long = 2289*1024*1024*1024
-  private final val L3ReadBandwidth: Long = 490*1024*1024*1024
-  private final val L1WriteBandwidth: Long = 3109*1024*1024*1024
-  private final val L2WriteBandwidth: Long = 2278*1024*1024*1024
-  private final val L3WriteBandwidth: Long = 354*1024*1024*1024
-  private final val L1Latency: Double = 1.4 * 1e-9
-  private final val L2Latency: Double = 7.5 * 1e-9
-  private final val L3Latency: Double = 84.2 * 1e-9
-  private final val MemLatency: Double = 130 * 1e-9
-  private final val L1CacheSize: Double = 32*1024
-  private final val L2CacheSize: Double = 1024*1024
-  private final val L3CacheSize: Double = 16.5*1024*1024
-  private final val MemSize: Double = 187*1024*1024*1024
-  private final val parallelism: Int = 176
+  private final val NetworkBandwidth: Long = 13*1024*1024*1024/10
+  private final val MemSize: Long = 187*1024*1024*1024
+  private final val BandwidthR2CSer: Long = 50*1024*1024
+  private final val BandwidthC2RDeSer: Long = 33*1024*1024
+  private final val BandwidthHashing: Long = 641*1024*1024
+  private final val parallelism: Long = 200
 
-
-  import org.apache.spark.sql.catalyst.plans.logical.Statistics
   private def printStats(prefix: String, stats: Statistics): Unit = {
     println(s"$prefix stats:")
     println(s"  sizeInBytes: ${stats.sizeInBytes}")
@@ -69,12 +75,15 @@ class RoughCostModel extends LongCostModel {
       println(s"    maxLen: ${colStat.maxLen.getOrElse("N/A")}")
     }
   }
-
   def isJoin(node: SparkPlan): Boolean = {
     node match {
       case _: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase | _: BroadcastHashJoinExec | _: ShuffledHashJoinExec =>
         true
     }
+  }
+
+  def getMaterializationCost(intermediateDataSize: Long): Long = {
+    WeightMater * intermediateDataSize / MemWriteBandwidth
   }
 
   override def selfLongCostOf(node: SparkPlan): Long = {
@@ -87,11 +96,10 @@ class RoughCostModel extends LongCostModel {
         node.children.zipWithIndex.foreach { case (child, index) =>
           child.logicalLink.foreach { childLogicalPlan =>
             //println(s"Child $index Logical Plan: ${childLogicalPlan.getClass.getSimpleName}")
-            val calculatedCost = (childLogicalPlan.stats.sizeInBytes * BigInt(13)) / BigInt(10)
-            if (calculatedCost > 1000L) cost = 10L
+            val calculatedCost = WeightC2R * childLogicalPlan.stats.sizeInBytes.toLong / BandwidthC2RDeSer
+            if (calculatedCost > 1000L) cost = 1000L
             else if (calculatedCost < 1L) cost = 1L
             else cost = calculatedCost.toLong
-            //printStats(s"    Child $index", childLogicalPlan.stats)
           }
         }
         cost
@@ -101,7 +109,7 @@ class RoughCostModel extends LongCostModel {
         var cost = 0L
         node.children.zipWithIndex.foreach { case (child, index) =>
           child.logicalLink.foreach { childLogicalPlan =>
-            val calculatedCost = childLogicalPlan.stats.sizeInBytes * 100
+            val calculatedCost = WeightR2C * childLogicalPlan.stats.sizeInBytes.toLong / BandwidthR2CSer
             if (calculatedCost > 1000L) cost = 1000L
             else if (calculatedCost < 1L) cost = 1L
             else cost = calculatedCost.toLong
@@ -110,19 +118,26 @@ class RoughCostModel extends LongCostModel {
         }
         cost
       }
+      // Cost Model for Native Join
       case join@(_: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase) => {
         {
-          var buildSize = 0L
-          var probeSize = 0L
-          var finalCost = 0L
           val logicalPlan = node.logicalLink.get
           val stats = logicalPlan.stats
+          var buildSize = 0L
+          var probeSize = 0L
           var maxNdv = 0L
           var leftNdv = 0L
           var rightNdv = 0L
+          var buildNdv = 0L
           var probeNdv = 0L
           var networkCost = 0L
-
+          var finalCost = 0L
+          var buildCost = 0L
+          var probeCost = 0L
+          var buildMemCost = 0L
+          var probeMemCost = 0L
+          var buildComputeCost = 0L
+          var probeComputeCost = 0L
           var estimatedOutputRow = stats.rowCount.map(_.toLong).getOrElse(0L)
           def getDistinctCount(attr: Attribute, stats: Statistics): BigInt = {
             stats.attributeStats.get(attr).flatMap(_.distinctCount).getOrElse(
@@ -130,6 +145,7 @@ class RoughCostModel extends LongCostModel {
             )
           }
           join match {
+            // SHJ
             case shj: ShuffledHashJoinExecTransformerBase => {
               shj.joinBuildSide match {
                 case BuildLeft =>
@@ -141,6 +157,7 @@ class RoughCostModel extends LongCostModel {
                   }.getOrElse((0L, BigInt(0)))
                   buildSize += buildcostTemp
                   leftNdv = leftNdvTemp.toLong
+                  buildNdv = leftNdv
 
                   val (probecostTemp, rightNdvTemp) = shj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
@@ -160,6 +177,7 @@ class RoughCostModel extends LongCostModel {
                   }.getOrElse((0L, BigInt(0)))
                   buildSize += buildcostTemp
                   rightNdv = rightNdvTemp.toLong
+                  buildNdv = rightNdv
 
                   val (probecostTemp, leftNdvTemp) = shj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
@@ -169,11 +187,18 @@ class RoughCostModel extends LongCostModel {
                   probeSize += probecostTemp
                   leftNdv = leftNdvTemp.toLong
                   probeNdv = leftNdv
-                  maxNdv = Math.max(leftNdv, rightNdv)
                 }
-                networkCost = 1.0 * (parallelism) * (buildSize / NetworkBandwidth)
+                maxNdv = Math.max(leftNdv, rightNdv)
+                networkCost = (WeightShuffle * (1-1.0/parallelism) * ((buildSize.toDouble + probeSize.toDouble)  / NetworkBandwidth)).toLong
+                val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
+                buildMemCost = WeightBuildMem * parallelism * (buildSize/MemReadBandwidth + buildNdv*WeightHashTableEntry/MemWriteBandwidth)
+                buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing
+
+                probeMemCost = WeightProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv*CacheLineSize/(MemReadBandwidth*parallelism))
+                probeComputeCost = WeightProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing 
               }
-              case bhj: BroadcastHashJoinExecTransformerBase => {
+            // BHJ
+            case bhj: BroadcastHashJoinExecTransformerBase => {
                 //println("native broadcastHashJoin")
                 def getDistinctCount(attr: Attribute, stats: Statistics): BigInt = {
                   stats.attributeStats.get(attr).flatMap(_.distinctCount).getOrElse(
@@ -210,7 +235,7 @@ class RoughCostModel extends LongCostModel {
                     }.getOrElse((0L, BigInt(0)))
                     buildSize += buildcostTemp
                     rightNdv = rightNdvTemp.toLong
-
+                    buildNdv = rightNdv
                     val (probecostTemp, leftNdvTemp) = bhj.left.logicalLink.map { leftLogicalPlan =>
                       val leftStats = leftLogicalPlan.stats
                       val leftNdv = bhj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, leftStats) }.max
@@ -218,127 +243,151 @@ class RoughCostModel extends LongCostModel {
                     }.getOrElse((0L, BigInt(0)))
                     probeSize += probecostTemp
                     leftNdv = leftNdvTemp.toLong
-                    buildNdv = leftNdv
+                    probeNdv = leftNdv
                     maxNdv = Math.max(leftNdv, rightNdv)
                 }
-                networkCost = 1.0 * (buildSize + probeSize) / NetworkBandwidth
+                networkCost = (WeightShuffle * (buildSize.toDouble) * (parallelism-1) / NetworkBandwidth).toLong
                 maxNdv = Math.max(leftNdv, rightNdv)
+                val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
+                buildMemCost = WeightBuildMem * parallelism * (buildSize/MemReadBandwidth/parallelism + buildNdv*WeightHashTableEntry/MemWriteBandwidth/parallelism)
+                buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing / parallelism
+                probeMemCost = WeightProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv/parallelism*CacheLineSize/MemReadBandwidth)
+                probeComputeCost = WeightProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing
               }
             }
             if (maxNdv == 0) maxNdv = 1
             estimatedOutputRow = buildSize * probeSize / maxNdv
-            val buildCost = buildSize / MemReadBandwidth * 1.0
-            val probeCost = 0L
-            if (buildSize < L1CacheSize) {
-              probeCost = 1.0 * (probeSize / MemReadBandwidth)
-            } else if (buildSize < L2CacheSize) {
-              probeCost = 1.0 * (probeSize / MemReadBandwidth + Math.min(1, L1CacheSize/buildSize) * (probeNdv * CacheLineSize) / L2ReadBandwidth)
-            } else if (buildSize < L3CacheSize) {
-              probeCost = 1.0 * (probeSize / MemReadBandwidth + Math.min(1, L2CacheSize/buildSize) * (probeNdv * CacheLineSize) / L3ReadBandwidth)
-            } else {
-              probeCost = 1.0 * (probeSize / MemReadBandwidth + Math.min(1, L3CacheSize/buildSize) * (probeNdv * CacheLineSize) / MemReadBandwidth)
-            }
-
+            buildCost = Math.max(buildComputeCost, buildMemCost)
+            probeCost = Math.max(probeMemCost, probeComputeCost)
+            var calculatedCost = buildCost + networkCost + probeCost + getMaterializationCost(estimatedOutputRow) 
             if (calculatedCost.compareTo(1000L) > 0) finalCost = 1000L
             else if (calculatedCost.compareTo(10L) < 0) finalCost = 10L
             else finalCost = calculatedCost
-            finalCost
+            finalCost.toLong
           }
         }
+
+        // Cost Model for Codegen-Vanilla Execution
         case join@(_: BroadcastHashJoinExec | _: ShuffledHashJoinExec) =>
-        def countJoinsInPath(node: SparkPlan): Int = {
-          node match {
-            case _: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase  | _: BroadcastHashJoinExec | _: ShuffledHashJoinExec =>
-              1 + node.children.map(countJoinsInPath).sum
-            case _ => node.children.map(countJoinsInPath).sum
-          }
-        }
-
-        var finalCost = 0L
-
-        def setJoinCosts(node: SparkPlan, shouldSetCost: Boolean, depth: Int = 0): Long = {
-          if (depth > 20) { // Add a depth limit to prevent infinite recursion
-            return 0L
-          }
-          val calculatedCost = 0L
-          if (shouldSetCost && node.getTagValue(new TreeNodeTag[AnyVal]("cost")).isDefined) {
-            node.getTagValue(new TreeNodeTag[AnyVal]("cost")).get match {
-              case l: Long => l
-              case d: Double => d.toLong
-              case _ => 0L
-            }
-          } else {
+          def countJoinsInPath(node: SparkPlan): Int = {
             node match {
-              case _: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase  | _: BroadcastHashJoinExec | _: ShuffledHashJoinExec => {
-                var buildsize = 0L
-                var probesize = 0L
-                val logicalPlan = node.logicalLink.get
-                val stats = logicalPlan.stats
-                var estimatedRow = 0L
-                join match {
-                  case shj: ShuffledHashJoinExec =>
-                    val (leftPlan, rightPlan) = (shj.left.logicalLink.get, shj.right.logicalLink.get)
-                    val leftStats = leftPlan.stats
-                    val rightStats = rightPlan.stats
-                    // Handle ExistenceJoin and other join types
-                    val joinType = shj.joinType match {
-                      case ExistenceJoin(_) => LeftSemi
-                      case other => JoinType(other.toString)
-                    }
-                    val dummyJoin = Join(
-                      leftPlan,
-                      rightPlan,
-                      joinType,
-                      shj.condition,
-                      JoinHint.NONE
-                    )
-                    estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
-                    shj.buildSide match {
-                      case BuildLeft =>
-                        buildsize = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                        probesize = shj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                      case BuildRight =>
-                        buildsize = shj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                        probesize = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                    }
-                    calculatedCost = buildsize
-                    
-                  case bhj: BroadcastHashJoinExec =>
-                    val (leftPlan, rightPlan) = (bhj.left.logicalLink.get, bhj.right.logicalLink.get)
-                    val leftStats = leftPlan.stats
-                    val rightStats = rightPlan.stats
-                    val joinType = bhj.joinType match {
-                      case ExistenceJoin(_) => LeftSemi
-                      case other => JoinType(other.toString)
-                    }
-                    val dummyJoin = Join(
-                      leftPlan,
-                      rightPlan,
-                      joinType,
-                      bhj.condition,
-                      JoinHint.NONE
-                    )
-                    estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
-                    //println("row count is" + estimatedRow)
-                    bhj.buildSide match {
-                      case BuildLeft =>
-                        buildsize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                        probesize = bhj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                      case BuildRight =>
-                        buildsize = bhj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                        probesize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
-                    }
+              case _: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase  | _: BroadcastHashJoinExec | _: ShuffledHashJoinExec =>
+                1 + node.children.map(countJoinsInPath).sum
+              case _ => node.children.map(countJoinsInPath).sum
+            }
+          }
+
+          var finalCost = 0L
+
+          def setJoinCosts(node: SparkPlan, shouldSetCost: Boolean, depth: Int = 0): Long = {
+            if (depth > 20) { // Add a depth limit to prevent infinite recursion
+              return 0L
+            }
+            val calculatedCost = 0L
+            if (shouldSetCost && node.getTagValue(new TreeNodeTag[AnyVal]("cost")).isDefined) {
+              node.getTagValue(new TreeNodeTag[AnyVal]("cost")).get match {
+                case l: Long => l
+                case d: Double => d.toLong
+                case _ => 0L
+              }
+            } else {
+              node match {
+                case _: BroadcastHashJoinExecTransformerBase | _: ShuffledHashJoinExecTransformerBase  | _: BroadcastHashJoinExec | _: ShuffledHashJoinExec => {
+                  var buildSize = 0L
+                  var probeSize = 0L
+                  val logicalPlan = node.logicalLink.get
+                  val stats = logicalPlan.stats
+                  var estimatedRow = 0L
+                  var networkCost = 0.0
+                  var buildCost = 0L
+                  var probeCost = 0L
+                  var buildNdv = 0L
+                  var probeNdv = 0L
+                  var buildMemCost = 0L
+                  var probeMemCost = 0L
+                  var buildComputeCost = 0L
+                  var probeComputeCost = 0L
 
 
-                }
-
-                //val calculatedCost = -4 * math.log(buildcost + 1) + 22 * math.log(probecost + 1) + {
-                //  val firstTwoDigits = estimatedRow.toString.take(2).toLong
-                //  if (firstTwoDigits < 10) firstTwoDigits else firstTwoDigits / 10
-                //}
-                
-                node.setTagValue(new TreeNodeTag[AnyVal]("cost"), calculatedCost)
-                calculatedCost.toLong
+                  join match {
+                    case shj: ShuffledHashJoinExec =>
+                      val (leftPlan, rightPlan) = (shj.left.logicalLink.get, shj.right.logicalLink.get)
+                      val leftStats = leftPlan.stats
+                      val rightStats = rightPlan.stats
+                      // Handle ExistenceJoin and other join types
+                      val joinType = shj.joinType match {
+                        case ExistenceJoin(_) => LeftSemi
+                        case other => JoinType(other.toString)
+                      }
+                      val dummyJoin = Join(
+                        leftPlan,
+                        rightPlan,
+                        joinType,
+                        shj.condition,
+                        JoinHint.NONE
+                      )
+                      estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
+                      shj.buildSide match {
+                        case BuildLeft =>
+                          buildSize = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          probeSize = shj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          buildNdv = shj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                          probeNdv = shj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                        case BuildRight =>
+                          buildSize = shj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          probeSize = shj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          buildNdv = shj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                          probeNdv = shj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                      }
+                      val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
+                      networkCost = WeightRowShuffle * (buildSize+probeSize) / NetworkBandwidth * (1-1/parallelism)
+                      buildMemCost = WeightCodegenBuildMem * parallelism * (buildSize/MemReadBandwidth/parallelism + buildNdv*WeightHashTableEntry/MemWriteBandwidth/parallelism)
+                      buildComputeCost = WeightCodegenBuildCompute * parallelism * buildSize / BandwidthHashing / parallelism
+                      probeMemCost = WeightCodegenProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv/parallelism*CacheLineSize/MemReadBandwidth)
+                      probeComputeCost = WeightCodegenProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing
+                    case bhj: BroadcastHashJoinExec =>
+                      val (leftPlan, rightPlan) = (bhj.left.logicalLink.get, bhj.right.logicalLink.get)
+                      val leftStats = leftPlan.stats
+                      val rightStats = rightPlan.stats
+                      val joinType = bhj.joinType match {
+                        case ExistenceJoin(_) => LeftSemi
+                        case other => JoinType(other.toString)
+                      }
+                      val dummyJoin = Join(
+                        leftPlan,
+                        rightPlan,
+                        joinType,
+                        bhj.condition,
+                        JoinHint.NONE
+                      )
+                      estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
+                      //println("row count is" + estimatedRow)
+                      bhj.buildSide match {
+                        case BuildLeft =>
+                          buildSize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          probeSize = bhj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          buildNdv = bhj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                          probeNdv = bhj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                        case BuildRight =>
+                          buildSize = bhj.right.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          probeSize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
+                          buildNdv = bhj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                          probeNdv = bhj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                      }
+                      val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
+                      networkCost = WeightShuffle * (buildSize) * (parallelism-1) / NetworkBandwidth 
+                      buildMemCost = WeightCodegenBuildMem * parallelism * (buildSize/MemReadBandwidth + buildNdv*WeightHashTableEntry/MemWriteBandwidth)
+                      buildComputeCost = WeightCodegenBuildCompute * parallelism * buildSize / BandwidthHashing
+                      probeMemCost = WeightCodegenProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv/parallelism*CacheLineSize/MemReadBandwidth)
+                      probeComputeCost = WeightCodegenProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing
+                  }
+                  buildCost = Math.max(buildComputeCost, buildMemCost)
+                  probeCost = Math.max(probeMemCost, probeComputeCost)
+                  var calculatedCost = buildCost + networkCost + probeCost
+                  if (calculatedCost.compareTo(1000L) > 0) calculatedCost = 1000L
+                  else if (calculatedCost.compareTo(10L) < 0) calculatedCost = 10L
+                  node.setTagValue(new TreeNodeTag[AnyVal]("cost"), calculatedCost)
+                  calculatedCost.toLong
               }
               case _ => node.children.map(setJoinCosts(_, shouldSetCost, depth + 1)).sum
             }
@@ -388,7 +437,7 @@ class RoughCostModel extends LongCostModel {
           var cost = 0L
           node.children.zipWithIndex.foreach { case (child, index) =>
             child.logicalLink.foreach { childLogicalPlan =>
-              val calculatedCost = childLogicalPlan.stats.sizeInBytes / MemReadBandwidth
+              val calculatedCost = childLogicalPlan.stats.sizeInBytes.toLong / MemReadBandwidth
               if (calculatedCost > 1000L) cost = 1000L
               else if (calculatedCost < 1L) cost = 1L
               else cost = calculatedCost.toLong
@@ -401,7 +450,7 @@ class RoughCostModel extends LongCostModel {
           var cost = 0L
           node.children.zipWithIndex.foreach { case (child, index) =>
             child.logicalLink.foreach { childLogicalPlan =>
-              val calculatedCost = childLogicalPlan.stats.sizeInBytes / MemReadBandwidth
+              val calculatedCost = childLogicalPlan.stats.sizeInBytes.toLong / MemReadBandwidth
               if (calculatedCost > 1000L) cost = 1000L
               else if (calculatedCost < 1L) cost = 1L
               else cost = calculatedCost.toLong
@@ -414,7 +463,6 @@ class RoughCostModel extends LongCostModel {
         case RowToColumnarLike(_) => 10L
         case p if PlanUtil.isGlutenColumnarOp(p) => 10L
         case p if PlanUtil.isVanillaColumnarOp(p) => 1000L
-        // Other row ops. Usually a vanilla row op.
         case _ => 1000L
       }
     }
