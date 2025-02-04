@@ -32,8 +32,8 @@ import org.apache.spark.sql.catalyst.plans.logical.Statistics
 
 class RoughCostModel extends LongCostModel {
 
-  private final val WeightR2C: Long = 5
-  private final val WeightC2R: Long = 2
+  private final val WeightR2C: Long = 10
+  private final val WeightC2R: Long = 4
   private final val WeightMater: Long = 5
   private final val WeightBroadCast: Long = 3
   private final val WeightShuffle: Long = 4
@@ -49,17 +49,17 @@ class RoughCostModel extends LongCostModel {
   private final val WeightCodegenBuildCompute: Long = 3
   private final val WeightCodegenProbeCompute: Long = 7
 
-  private final val WeightHashTableEntry: Long = 16
-  private final val L3CacheSize: Long = 17*1024*1024
-  private final val MemReadBandwidth: Long = 130*1024*1024*1024
-  private final val MemWriteBandwidth: Long = 160*1024*1024*1024
-  private final val CacheLineSize: Long = 64
-  private final val NetworkBandwidth: Long = 13*1024*1024*1024/10
-  private final val MemSize: Long = 187*1024*1024*1024
-  private final val BandwidthR2CSer: Long = 50*1024*1024
-  private final val BandwidthC2RDeSer: Long = 33*1024*1024
-  private final val BandwidthHashing: Long = 641*1024*1024
-  private final val parallelism: Long = 200
+  private final val WeightHashTableEntry: Long = 16L
+  private final val L3CacheSize: Long = 17L*1024L*1024L
+  private final val MemReadBandwidth: Long = 13L*1024L*1024L*1024L
+  private final val MemWriteBandwidth: Long = 16L*1024L*1024L*1024L
+  private final val CacheLineSize: Long = 64L
+  private final val NetworkBandwidth: Long = 13L*1024L*1024L*1024L/10L
+  private final val MemSize: Long = 187L*1024L*1024L*1024L
+  private final val BandwidthR2CSer: Long = 50L*1024L*1024L
+  private final val BandwidthC2RDeSer: Long = 33L*1024L*1024L
+  private final val BandwidthHashing: Long = 641L*1024L*1024L
+  private final val parallelism: Long = 200L
 
   private def printStats(prefix: String, stats: Statistics): Unit = {
     println(s"$prefix stats:")
@@ -95,7 +95,6 @@ class RoughCostModel extends LongCostModel {
         var cost = 0L
         node.children.zipWithIndex.foreach { case (child, index) =>
           child.logicalLink.foreach { childLogicalPlan =>
-            //println(s"Child $index Logical Plan: ${childLogicalPlan.getClass.getSimpleName}")
             val calculatedCost = WeightC2R * childLogicalPlan.stats.sizeInBytes.toLong / BandwidthC2RDeSer
             if (calculatedCost > 1000L) cost = 1000L
             else if (calculatedCost < 1L) cost = 1L
@@ -149,57 +148,68 @@ class RoughCostModel extends LongCostModel {
             case shj: ShuffledHashJoinExecTransformerBase => {
               shj.joinBuildSide match {
                 case BuildLeft =>
-                  // Get the left child's logical plan and stats
-                  val (buildcostTemp, leftNdvTemp) = shj.left.logicalLink.map { leftLogicalPlan =>
+                  val (buildcostTemp, leftNdvTemp, buildTupleSize) = shj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
                     val leftNdv = shj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, leftStats) }.max
-                    (leftStats.sizeInBytes.toLong, leftNdv)
-                  }.getOrElse((0L, BigInt(0)))
+                    val avgTupleSize = if (leftStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                      leftStats.sizeInBytes.toLong / leftStats.rowCount.get.toLong
+                    } else 0L
+                    (leftStats.sizeInBytes.toLong, leftNdv, avgTupleSize)
+                  }.getOrElse((0L, BigInt(1), 0L))
                   buildSize += buildcostTemp
                   leftNdv = leftNdvTemp.toLong
                   buildNdv = leftNdv
 
-                  val (probecostTemp, rightNdvTemp) = shj.right.logicalLink.map { rightLogicalPlan =>
+                  val (probecostTemp, rightNdvTemp, probeTupleSize) = shj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
                     val rightNdv = shj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, rightStats) }.max
-                    (rightStats.sizeInBytes.toLong, rightNdv)
-                  }.getOrElse((0L, BigInt(0)))
+                    val avgTupleSize = if (rightStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                      rightStats.sizeInBytes.toLong / rightStats.rowCount.get.toLong  
+                    } else 0L
+                    (rightStats.sizeInBytes.toLong, rightNdv, avgTupleSize)
+                  }.getOrElse((0L, BigInt(1), 0L))
                   probeSize += probecostTemp
                   rightNdv = rightNdvTemp.toLong
                   probeNdv = rightNdv
 
                 case BuildRight =>
-                  // Similar logic for BuildRight
-                  val (buildcostTemp, rightNdvTemp) = shj.right.logicalLink.map { rightLogicalPlan =>
+                  val (buildcostTemp, rightNdvTemp, buildTupleSize) = shj.right.logicalLink.map { rightLogicalPlan =>
                     val rightStats = rightLogicalPlan.stats
                     val rightNdv = shj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, rightStats) }.max
-                    (rightStats.sizeInBytes.toLong, rightNdv)
-                  }.getOrElse((0L, BigInt(0)))
+                    val avgTupleSize = if (rightStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                      rightStats.sizeInBytes.toLong / rightStats.rowCount.get.toLong
+                    } else 0L
+                    (rightStats.sizeInBytes.toLong, rightNdv, avgTupleSize)
+                  }.getOrElse((0L, BigInt(1), 0L))
                   buildSize += buildcostTemp
                   rightNdv = rightNdvTemp.toLong
                   buildNdv = rightNdv
 
-                  val (probecostTemp, leftNdvTemp) = shj.left.logicalLink.map { leftLogicalPlan =>
+                  val (probecostTemp, leftNdvTemp, probeTupleSize) = shj.left.logicalLink.map { leftLogicalPlan =>
                     val leftStats = leftLogicalPlan.stats
                     val leftNdv = shj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, leftStats) }.max
-                    (leftStats.sizeInBytes.toLong, leftNdv)
-                  }.getOrElse((0L, BigInt(0)))
+                    val avgTupleSize = if (leftStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                      leftStats.sizeInBytes.toLong / leftStats.rowCount.get.toLong
+                    } else 0L
+                    (leftStats.sizeInBytes.toLong, leftNdv, avgTupleSize)
+                  }.getOrElse((0L, BigInt(1), 0L))
                   probeSize += probecostTemp
                   leftNdv = leftNdvTemp.toLong
                   probeNdv = leftNdv
                 }
                 maxNdv = Math.max(leftNdv, rightNdv)
+                if (buildNdv == 0) {
+                  buildNdv = 1
+                }
                 networkCost = (WeightShuffle * (1-1.0/parallelism) * ((buildSize.toDouble + probeSize.toDouble)  / NetworkBandwidth)).toLong
                 val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
                 buildMemCost = WeightBuildMem * parallelism * (buildSize/MemReadBandwidth + buildNdv*WeightHashTableEntry/MemWriteBandwidth)
-                buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing
-
                 probeMemCost = WeightProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv*CacheLineSize/(MemReadBandwidth*parallelism))
+                buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing
                 probeComputeCost = WeightProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing 
               }
             // BHJ
             case bhj: BroadcastHashJoinExecTransformerBase => {
-                //println("native broadcastHashJoin")
                 def getDistinctCount(attr: Attribute, stats: Statistics): BigInt = {
                   stats.attributeStats.get(attr).flatMap(_.distinctCount).getOrElse(
                     // Fallback to total row count if distinct count is not available
@@ -209,38 +219,50 @@ class RoughCostModel extends LongCostModel {
                 bhj.joinBuildSide match {
                   case BuildLeft =>
                     // Get the left child's logical plan and stats
-                    val (buildcostTemp, leftNdvTemp) = bhj.left.logicalLink.map { leftLogicalPlan =>
+                    val (buildcostTemp, leftNdvTemp, buildTupleSize) = bhj.left.logicalLink.map { leftLogicalPlan =>
                       val leftStats = leftLogicalPlan.stats
                       val leftNdv = bhj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, leftStats) }.max
-                      (leftStats.sizeInBytes.toLong, leftNdv)
-                    }.getOrElse((0L, BigInt(0)))
+                      val avgTupleSize = if (leftStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                        leftStats.sizeInBytes.toLong / leftStats.rowCount.get.toLong
+                      } else 0L
+                      (leftStats.sizeInBytes.toLong, leftNdv, avgTupleSize)
+                    }.getOrElse((0L, BigInt(1), 0L)) // Default NDV to 1 instead of 0
                     buildSize += buildcostTemp
                     leftNdv = leftNdvTemp.toLong
 
-                    val (probecostTemp, rightNdvTemp) = bhj.right.logicalLink.map { rightLogicalPlan =>
+                    val (probecostTemp, rightNdvTemp, probeTupleSize) = bhj.right.logicalLink.map { rightLogicalPlan =>
                       val rightStats = rightLogicalPlan.stats
                       val rightNdv = bhj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, rightStats) }.max
-                      (rightStats.sizeInBytes.toLong, rightNdv)
-                    }.getOrElse((0L, BigInt(0)))
+                      val avgTupleSize = if (rightStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                        rightStats.sizeInBytes.toLong / rightStats.rowCount.get.toLong
+                      } else 0L
+                      (rightStats.sizeInBytes.toLong, rightNdv, avgTupleSize)
+                    }.getOrElse((0L, BigInt(1), 0L)) // Default NDV to 1 instead of 0
                     probeSize += probecostTemp
                     rightNdv = rightNdvTemp.toLong
                     probeNdv = rightNdv
                   case BuildRight =>
                     // Similar logic for BuildRight if needed
                     // build table
-                    val (buildcostTemp, rightNdvTemp) = bhj.right.logicalLink.map { rightLogicalPlan =>
+                    val (buildcostTemp, rightNdvTemp, buildTupleSize) = bhj.right.logicalLink.map { rightLogicalPlan =>
                       val rightStats = rightLogicalPlan.stats
                       val rightNdv = bhj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, rightStats) }.max
-                      (rightStats.sizeInBytes.toLong, rightNdv)
-                    }.getOrElse((0L, BigInt(0)))
+                      val avgTupleSize = if (rightStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                        rightStats.sizeInBytes.toLong / rightStats.rowCount.get.toLong
+                      } else 0L
+                      (rightStats.sizeInBytes.toLong, rightNdv, avgTupleSize)
+                    }.getOrElse((0L, BigInt(1), 0L)) // Default NDV to 1 instead of 0
                     buildSize += buildcostTemp
                     rightNdv = rightNdvTemp.toLong
                     buildNdv = rightNdv
-                    val (probecostTemp, leftNdvTemp) = bhj.left.logicalLink.map { leftLogicalPlan =>
+                    val (probecostTemp, leftNdvTemp, probeTupleSize) = bhj.left.logicalLink.map { leftLogicalPlan =>
                       val leftStats = leftLogicalPlan.stats
                       val leftNdv = bhj.leftKeys.collect { case attr: Attribute => getDistinctCount(attr, leftStats) }.max
-                      (leftStats.sizeInBytes.toLong, leftNdv)
-                    }.getOrElse((0L, BigInt(0)))
+                      val avgTupleSize = if (leftStats.rowCount.getOrElse(BigInt(0)) > 0) {
+                        leftStats.sizeInBytes.toLong / leftStats.rowCount.get.toLong
+                      } else 0L
+                      (leftStats.sizeInBytes.toLong, leftNdv, avgTupleSize)
+                    }.getOrElse((0L, BigInt(1), 0L)) // Default NDV to 1 instead of 0
                     probeSize += probecostTemp
                     leftNdv = leftNdvTemp.toLong
                     probeNdv = leftNdv
@@ -248,15 +270,25 @@ class RoughCostModel extends LongCostModel {
                 }
                 networkCost = (WeightShuffle * (buildSize.toDouble) * (parallelism-1) / NetworkBandwidth).toLong
                 maxNdv = Math.max(leftNdv, rightNdv)
+                if (buildNdv == 0) {
+                  buildNdv = 1
+                }
                 val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
-                buildMemCost = WeightBuildMem * parallelism * (buildSize/MemReadBandwidth/parallelism + buildNdv*WeightHashTableEntry/MemWriteBandwidth/parallelism)
-                buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing / parallelism
-                probeMemCost = WeightProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv/parallelism*CacheLineSize/MemReadBandwidth)
-                probeComputeCost = WeightProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing
+                if (MemReadBandwidth == 0 || MemWriteBandwidth == 0) {
+                  buildComputeCost = WeightBuildCompute * parallelism * buildSize / BandwidthHashing / parallelism
+                  probeComputeCost = WeightProbeCompute * parallelism * probeSize / parallelism / BandwidthHashing
+                } else {
+                  buildMemCost = WeightBuildMem * parallelism * (buildSize/MemReadBandwidth/parallelism + buildNdv*WeightHashTableEntry/MemWriteBandwidth/parallelism)
+                  probeMemCost = WeightProbeMem * parallelism * (probeSize/parallelism/MemReadBandwidth + estimatedCacheMiss*probeNdv/parallelism*CacheLineSize/MemReadBandwidth)
+
+                }
+
               }
             }
             if (maxNdv == 0) maxNdv = 1
-            estimatedOutputRow = buildSize * probeSize / maxNdv
+            // For inner join, output cardinality is approximately (build table size * probe table size) / max(distinct values)
+            // This assumes uniform data distribution and independence between join keys
+            estimatedOutputRow = (buildSize * probeSize) / maxNdv
             buildCost = Math.max(buildComputeCost, buildMemCost)
             probeCost = Math.max(probeMemCost, probeComputeCost)
             var calculatedCost = buildCost + networkCost + probeCost + getMaterializationCost(estimatedOutputRow) 
@@ -339,6 +371,9 @@ class RoughCostModel extends LongCostModel {
                           buildNdv = shj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
                           probeNdv = shj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
                       }
+                      if (buildNdv == 0) {
+                        buildNdv = 1
+                      }
                       val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
                       networkCost = WeightRowShuffle * (buildSize+probeSize) / NetworkBandwidth * (1-1/parallelism)
                       buildMemCost = WeightCodegenBuildMem * parallelism * (buildSize/MemReadBandwidth/parallelism + buildNdv*WeightHashTableEntry/MemWriteBandwidth/parallelism)
@@ -361,7 +396,6 @@ class RoughCostModel extends LongCostModel {
                         JoinHint.NONE
                       )
                       estimatedRow = JoinEstimation(dummyJoin).estimate.flatMap(_.rowCount).map(_.toLong).getOrElse(0L)
-                      //println("row count is" + estimatedRow)
                       bhj.buildSide match {
                         case BuildLeft =>
                           buildSize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
@@ -373,6 +407,9 @@ class RoughCostModel extends LongCostModel {
                           probeSize = bhj.left.logicalLink.map(_.stats.sizeInBytes.toLong).getOrElse(0L)
                           buildNdv = bhj.right.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
                           probeNdv = bhj.left.logicalLink.flatMap(_.stats.rowCount).map(_.toLong).getOrElse(0L)
+                      }
+                      if (buildNdv == 0) {
+                        buildNdv = 1
                       }
                       val estimatedCacheMiss = (1 - L3CacheSize / (buildNdv * WeightHashTableEntry))
                       networkCost = WeightShuffle * (buildSize) * (parallelism-1) / NetworkBandwidth 
@@ -408,7 +445,6 @@ class RoughCostModel extends LongCostModel {
         case nativeProject: ProjectExecTransformer =>
           nativeProject.child match {
             case _: BroadcastHashJoinExec  | _: BroadcastHashJoinExecTransformerBase  | _: ShuffledHashJoinExec | _:ShuffledHashJoinExecTransformerBase => {
-              println("Join + Project Detected")
               100000L
             }
             case _ => 10L
@@ -424,7 +460,6 @@ class RoughCostModel extends LongCostModel {
 
           val joinCount = countJoinsInPath(nativeAgg)
           if (joinCount >= 4) {
-            println(s"Multiple joins ($joinCount) detected in the path of HashAggregateExecBaseTransformer")
             100000L
           } else {
             // Default cost for HashAggregateExecBaseTransformer
