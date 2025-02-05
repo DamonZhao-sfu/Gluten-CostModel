@@ -79,9 +79,6 @@ bool dataVerif = true;
 const uint32_t RSIZE_DIV = 16;   //for SR it should be 4 else 16
 const uint32_t PIPELINE_DEPTH = 576;
 uint32_t nrows = 0;
-std::string orc_file = "/localssd/hza214/80M.orc";
-std::string check_file = "lineitem_col1.bin"; 
-
 const uint8_t SR = 0;
 const uint8_t DIRECT = 1;
 const uint8_t PATCHED = 2;
