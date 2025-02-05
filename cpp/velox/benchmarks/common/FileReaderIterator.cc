@@ -17,9 +17,7 @@
 
 #include "FileReaderIterator.h"
 #include "benchmarks/common/ParquetReaderIterator.h"
-#ifdef GLUTEN_ENABLE_ORC
 #include "benchmarks/common/OrcReaderIterator.h"
-#endif
 
 std::shared_ptr<gluten::ResultIterator> gluten::getInputIteratorFromFileReader(
     const std::string& path,
@@ -34,14 +32,15 @@ std::shared_ptr<gluten::ResultIterator> gluten::getInputIteratorFromFileReader(
       return std::make_shared<gluten::ResultIterator>(std::make_unique<ParquetBufferedReaderIterator>(path));
     }
   } else if (suffix == kOrcSuffix) {
-#ifdef GLUTEN_ENABLE_ORC
+    if (readerType == FileReaderType::kfpga) {
+      return std::make_shared<gluten::ResultIterator>(std::make_unique<FORCReaderIterator>(path));
+    }
     if (readerType == FileReaderType::kStream) {
       return std::make_shared<gluten::ResultIterator>(std::make_unique<OrcStreamReaderIterator>(path));
     }
     if (readerType == FileReaderType::kBuffered) {
       return std::make_shared<gluten::ResultIterator>(std::make_unique<OrcBufferedReaderIterator>(path));
     }
-#endif
   }
   throw new GlutenException("Unreachable.");
 }
